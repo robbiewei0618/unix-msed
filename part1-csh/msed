@@ -1,0 +1,666 @@
+#!/bin/csh -f
+#
+# msed -- sed with a few extra commands, written in C shell (no awk).
+#
+#     cat infile | ./msed '<program>' [arguments...]
+#
+# msed translates the program into an ordinary sed script and runs GNU
+# sed on it.  The full description is in ../README.md.  In short:
+#
+#   f        set the t flag              F        clear the t flag
+#   Z        delete up to and including the first newline (all if none)
+#   W file   write the first line of the pattern space to file
+#   C text   replace the pattern space with text and keep going
+#   D        delete the first line, restart without reading input
+#   $-N      address: N lines before the last ($-1, $-2, ...)
+#   $N       replaced by the N-th argument of msed ($2, $3, ...)
+#   \$N      a literal $N              ;     separates commands
+#   \;       a literal ;               the argument of a i c C w W r R
+#                                      ends at the first unescaped ;
+#
+# Temporary files:
+#   t4  standard input              t5  the program ($1)
+#   t6  the program as hex bytes    t7  scratch
+#   t8  the sed script, as hex      t9  the sed script that is run
+#
+# Why hex: a csh variable cannot safely hold quotes, backslashes, ! or
+# newlines.  The program is turned into a list of two-digit hex codes,
+# one word per byte, and the translator works on that list.  So every
+# test below compares plain words: 3b is ';', 5c is '\', and so on.
+
+set noglob
+set st = 1
+
+if ($#argv < 1) then
+    echo "usage: msed '<program>' [arguments...]" >> /dev/stderr
+    exit 1
+endif
+
+set tmp = /tmp/msed.$$
+set t4 = $tmp.t4
+set t5 = $tmp.t5
+set t6 = $tmp.t6
+set t7 = $tmp.t7
+set t8 = $tmp.t8
+set t9 = $tmp.t9
+onintr cleanup
+
+# ---------------------------------------------------------------- input
+cat > $t4
+printf '%s' $argv[1]:q > $t5
+od -An -v -tx1 $t5 > $t6
+cp /dev/null $t8
+
+# Number of input lines; $-N needs it.
+set last = `sed -n '$=' $t4`
+if ("$last" == "") set last = 0
+
+# ------------------------------------------------------------ hex codes
+set TAB = 09 NL = 0a SP = 20 BANG = 21 HASH = 23 DOL = 24 AMP = 26
+set PLUS = 2b COMMA = 2c DASH = 2d SLASH = 2f COLON = 3a SEMI = 3b
+set BSL = 5c LBR = 7b RBR = 7d TILDE = 7e
+
+# Pieces of the generated script.
+set S_SETF = (73 2f 5e 2f 2f)                       # s/^//
+set S_ZAP  = (73 2f 5e 5b 5e 5c 6e 5d 2a 5c 6e)     # s/^[^\n]*\n
+set S_ZAP  = ($S_ZAP 5c 7b 30 2c 31 5c 7d 2f 2f)    #   \{0,1\}//
+set S_ALL  = (73 2f 2e 2a 2f)                       # s/.*/
+set LABPFX = (5f 5f 6d 73 65 64)                    # __msed
+
+# The program, then sentinels, so that looking two words ahead never
+# runs off the end of the list.
+set p = (`cat $t6` ZZ ZZ ZZ)
+
+# ---------------------------------------------------------- translator
+#
+# A state machine.  Each pass looks at the word p[i] (c, and the next
+# two, c1 and c2) and either consumes input or moves to another state.
+#
+#   START    between commands           ADDR     one address
+#   DIGITS   a line number              RFLAGS   I or M after /regex/
+#   ADDREND  after an address           BANG     the ! after an address
+#   CMD      the command letter         FIELD    regex or replacement
+#   SREPL    s replacement follows      SFLAGS   s flags
+#   YDST     y destination follows      TSKIP    blanks before an argument
+#   TEXT     argument of a i c C w ...  LABEL    label of : b t T
+#   NUMARG   number after q Q l L       WRAP     expand C, Z, F
+#   ENDCMD   one command is finished    DONE, ERR
+#
+# out    words of the command being generated (address first)
+# addr   the address part of out, saved when the command letter is read
+# k      1 while reading the first address, 2 after the comma
+# dl     delimiter of the current FIELD; after: state that follows it
+# tmode  kind of TEXT: aic (a i c), C, or file (w W r R e, s///w)
+
+set i = 1
+set state = START
+set out = ()
+set addr = ()
+set txt = ()
+set lbl = ()
+set k = 1
+set nd = 0
+set lab = 0
+set splices = 0
+set err = ""
+
+while ($state != DONE && $state != ERR)
+    set c = $p[$i]
+    @ j = $i + 1
+    set c1 = $p[$j]
+    @ j = $i + 2
+    set c2 = $p[$j]
+
+    # $N where a command or an address is expected: splice the N-th
+    # argument into the program and read it as program text.  Inside a
+    # regex, replacement or text the value is copied into that field
+    # instead (FIELD and TEXT below).
+    if ($c == $DOL && "$c1" =~ 3[0-9]) then
+        if ($state == START || $state == ADDR || $state == CMD) then
+            @ splices++
+            if ($splices > 100) then
+                set err = "argument substitution does not terminate"
+                set state = ERR
+                continue
+            endif
+            @ e = $i + 1
+            set num = 0
+            while ("$p[$e]" =~ 3[0-9])
+                @ num = $num * 10 + $p[$e] - 30
+                @ e++
+            end
+            set val = ()
+            if ($num >= 1 && $num <= $#argv) then
+                printf '%s' $argv[$num]:q | od -An -v -tx1 > $t7
+                set val = (`cat $t7`)
+            endif
+            @ im = $i - 1
+            if ($im >= 1) then
+                set p = ($p[1-$im] $val $p[$e-])
+            else
+                set p = ($val $p[$e-])
+            endif
+            continue
+        endif
+    endif
+
+    switch ($state)
+
+    # ------------------------------------------------------------ START
+    case START:
+        if ($c == ZZ) then
+            set state = DONE
+        else if ($c == $SP || $c == $TAB || $c == $NL || $c == $SEMI) then
+            @ i++
+        else
+            set out = ()
+            set addr = ()
+            set k = 1
+            set state = ADDR
+        endif
+        breaksw
+
+    # ------------------------------------------------------------- ADDR
+    case ADDR:
+        if ($k == 2 && ($c == $SP || $c == $TAB)) then
+            @ i++
+        else if ("$c" =~ 3[0-9]) then
+            set state = DIGITS
+        else if ($c == $DOL && $c1 == $DASH && "$c2" =~ 3[0-9]) then
+            # $-N becomes a line number.  A start address before line 1
+            # never matches (use a line past the end); an end address
+            # before line 1 ends the range at once (0).
+            @ e = $i + 2
+            set num = 0
+            while ("$p[$e]" =~ 3[0-9])
+                @ num = $num * 10 + $p[$e] - 30
+                @ e++
+            end
+            @ num = $last - $num
+            if ($k == 1 && $num < 1) then
+                @ num = $last + 1
+            endif
+            if ($k == 2 && $num < 0) then
+                set num = 0
+            endif
+            set dg = ()
+            if ($num == 0) set dg = (30)
+            while ($num > 0)
+                @ d = $num % 10
+                set dg = (3$d $dg)
+                @ num = $num / 10
+            end
+            set out = ($out $dg)
+            set i = $e
+            set state = ADDREND
+        else if ($c == $DOL) then
+            set out = ($out $DOL)
+            @ i++
+            set state = ADDREND
+        else if ($c == $SLASH) then
+            set out = ($out $SLASH)
+            set dl = $SLASH
+            @ i++
+            set after = RFLAGS
+            set state = FIELD
+        else if ($c == $BSL) then
+            if ($c1 == ZZ || $c1 == $NL) then
+                set err = "unexpected end of program after a backslash"
+                set state = ERR
+            else
+                set out = ($out $BSL $c1)
+                set dl = $c1
+                @ i += 2
+                set after = RFLAGS
+                set state = FIELD
+            endif
+        else if ($k == 2 && ($c == $PLUS || $c == $TILDE)) then
+            set out = ($out $c)
+            @ i++
+            set state = DIGITS
+        else if ($k == 2) then
+            set err = "unexpected ,"
+            set state = ERR
+        else
+            set state = BANG
+        endif
+        breaksw
+
+    case DIGITS:
+        if ("$c" =~ 3[0-9]) then
+            set out = ($out $c)
+            @ i++
+        else if ($c == $TILDE && "$c1" =~ 3[0-9]) then
+            set out = ($out $c)
+            @ i++
+        else
+            set state = ADDREND
+        endif
+        breaksw
+
+    case RFLAGS:
+        if ($c == 49 || $c == 4d) then
+            set out = ($out $c)
+            @ i++
+        else
+            set state = ADDREND
+        endif
+        breaksw
+
+    case ADDREND:
+        if ($c == $SP || $c == $TAB) then
+            @ i++
+        else if ($c == $COMMA && $k == 1) then
+            set out = ($out $COMMA)
+            @ i++
+            set k = 2
+            set state = ADDR
+        else
+            set state = BANG
+        endif
+        breaksw
+
+    case BANG:
+        if ($c == $SP || $c == $TAB) then
+            @ i++
+        else if ($c == $BANG) then
+            set out = ($out $BANG)
+            @ i++
+        else
+            set addr = ($out)
+            set state = CMD
+        endif
+        breaksw
+
+    # -------------------------------------------------------------- CMD
+    case CMD:
+        set state = ENDCMD
+        if ($c == $LBR) then
+            set out = ($out $LBR $NL)
+            echo $out >> $t8
+            @ i++
+            set state = START
+        else if ($c == $RBR) then
+            set out = ($out $RBR)
+            @ i++
+        else if ($c == $HASH) then
+            # A comment.  Keep it only at the very start of the program,
+            # where "#n" means the same as sed -n.
+            set keep = 0
+            if ($i == 1) set keep = 1
+            while ($p[$i] != $NL && $p[$i] != ZZ)
+                if ($keep) set out = ($out $p[$i])
+                @ i++
+            end
+            if ($keep) then
+                set out = ($out $NL)
+                echo $out >> $t8
+            endif
+            set state = START
+        else if ($c == $COLON) then
+            set out = ($out $COLON)
+            set lbl = ()
+            set lmode = colon
+            @ i++
+            set state = LABEL
+        else if ($c == 62 || $c == 74 || $c == 54) then
+            # b t T
+            set out = ($out $c)
+            set lbl = ()
+            set lmode = branch
+            @ i++
+            set state = LABEL
+        else if ($c == 76) then
+            # v [version]: nothing to generate
+            set out = ()
+            set lbl = ()
+            set lmode = skip
+            @ i++
+            set state = LABEL
+        else if ($c == 73 || $c == 79) then
+            # s and y
+            if ($c1 == ZZ || $c1 == $NL || $c1 == $BSL) then
+                set err = "unterminated s or y command"
+                set state = ERR
+            else
+                set out = ($out $c $c1)
+                set dl = $c1
+                if ($c == 73) then
+                    set after = SREPL
+                else
+                    set after = YDST
+                endif
+                @ i += 2
+                set state = FIELD
+            endif
+        else if ($c == 61 || $c == 69 || $c == 63) then
+            # a i c: emitted as "a\" + newline + text
+            set out = ($out $c $BSL $NL)
+            set txt = ()
+            set tmode = aic
+            @ i++
+            set state = TSKIP
+        else if ($c == 43) then
+            # C text
+            set txt = ()
+            set tmode = C
+            @ i++
+            set state = TSKIP
+        else if ($c == 77 || $c == 57 || $c == 72 || $c == 52 || $c == 65) then
+            # w W r R e: a file name (or a command, for e)
+            set out = ($out $c $SP)
+            set txt = ()
+            set tmode = file
+            @ i++
+            set state = TSKIP
+        else if ($c == 66) then
+            # f: a substitution that always succeeds sets the flag
+            set out = ($out $S_SETF)
+            @ i++
+        else if ($c == 46) then
+            # F
+            set wmode = reset
+            @ i++
+            set state = WRAP
+        else if ($c == 5a) then
+            # Z
+            set S = ($S_ZAP)
+            set wmode = keepflag
+            @ i++
+            set state = WRAP
+        else if ($c == 71 || $c == 51 || $c == 6c || $c == 4c) then
+            # q Q l L, with an optional number
+            set out = ($out $c)
+            set nd = 0
+            @ i++
+            set state = NUMARG
+        else if ($c == 64 || $c == 44 || $c == 67 || $c == 47 || $c == 68 || $c == 48 || $c == 78 || $c == 6e || $c == 4e || $c == 70 || $c == 50 || $c == 7a || $c == 3d) then
+            # d D g G h H x n N p P z =
+            set out = ($out $c)
+            @ i++
+        else if ($c == ZZ || $c == $SEMI || $c == $NL) then
+            set err = "missing command"
+            set state = ERR
+        else
+            set err = "unknown command"
+            set state = ERR
+        endif
+        breaksw
+
+    # ------------------------------------------------------------ FIELD
+    # The body of /regex/, s/regex/replacement/ or y/src/dst/, up to
+    # the delimiter dl.  A backslash and the byte after it are copied
+    # as a pair, so \; \$ and \<dl> never end the field.
+    case FIELD:
+        if ($c == ZZ) then
+            set err = "unterminated regex, s or y command"
+            set state = ERR
+        else if ($c == $BSL) then
+            if ($c1 == ZZ) then
+                set err = "unterminated regex, s or y command"
+                set state = ERR
+            else
+                if ($c1 == $NL) then
+                    set out = ($out $BSL 6e)
+                else
+                    set out = ($out $BSL $c1)
+                endif
+                @ i += 2
+            endif
+        else if ($c == $dl) then
+            set out = ($out $dl)
+            @ i++
+            set state = $after
+        else if ($c == $DOL && "$c1" =~ 3[0-9]) then
+            # $N inside a field: the value stays inside the field.
+            @ e = $i + 1
+            set num = 0
+            while ("$p[$e]" =~ 3[0-9])
+                @ num = $num * 10 + $p[$e] - 30
+                @ e++
+            end
+            if ($num >= 1 && $num <= $#argv) then
+                printf '%s' $argv[$num]:q | od -An -v -tx1 > $t7
+                foreach v (`cat $t7`)
+                    if ($v == $dl) then
+                        set out = ($out $BSL $v)
+                    else if ($v == $NL) then
+                        set out = ($out $BSL 6e)
+                    else
+                        set out = ($out $v)
+                    endif
+                end
+            endif
+            set i = $e
+        else if ($c == $NL) then
+            set out = ($out $BSL 6e)
+            @ i++
+        else
+            set out = ($out $c)
+            @ i++
+        endif
+        breaksw
+
+    case SREPL:
+        set after = SFLAGS
+        set state = FIELD
+        breaksw
+
+    case YDST:
+        set after = ENDCMD
+        set state = FIELD
+        breaksw
+
+    case SFLAGS:
+        if ($c == 67 || $c == 70 || $c == 69 || $c == 49 || $c == 6d || $c == 4d || $c == 65 || "$c" =~ 3[0-9]) then
+            # g p i I m M e and a count
+            set out = ($out $c)
+            @ i++
+        else if ($c == 77) then
+            # w file
+            set out = ($out 77 $SP)
+            set txt = ()
+            set tmode = file
+            @ i++
+            set state = TSKIP
+        else
+            set state = ENDCMD
+        endif
+        breaksw
+
+    # ------------------------------------------------------------- TEXT
+    case TSKIP:
+        # Leading blanks are dropped.  "a\" then a newline is the classic
+        # form; "a\text" drops the backslash, as GNU sed does.  \; and \$
+        # are left for TEXT to read as escapes.
+        if ($c == $SP || $c == $TAB) then
+            @ i++
+        else if ($c == $BSL && $c1 == $NL) then
+            @ i += 2
+            set state = TEXT
+        else if ($c == $BSL && $c1 != $SEMI && $c1 != $DOL && $c1 != ZZ) then
+            @ i++
+            set state = TEXT
+        else
+            set state = TEXT
+        endif
+        breaksw
+
+    case TEXT:
+        # Ends at an unescaped ; or a newline (left for ENDCMD to see).
+        #   aic   text for a i c; sed itself reads its escapes later
+        #   C     becomes the replacement of s/.*/.../, so & and / are
+        #         escaped and \1..\9 lose their backslash
+        #   file  a file name, taken literally
+        if ($c == ZZ || $c == $SEMI || $c == $NL) then
+            if ($tmode == C) then
+                set S = ($S_ALL $txt $SLASH)
+                set wmode = keepflag
+                set state = WRAP
+            else
+                set out = ($out $txt)
+                set state = ENDCMD
+            endif
+        else if ($c == $BSL) then
+            if ($c1 == ZZ) then
+                # a lone backslash at the very end is taken literally
+                if ($tmode == file) then
+                    set txt = ($txt $BSL)
+                else
+                    set txt = ($txt $BSL $BSL)
+                endif
+                @ i++
+            else
+                if ($c1 == $SEMI || $c1 == $DOL) then
+                    set txt = ($txt $c1)
+                else if ($tmode == file && $c1 == $BSL) then
+                    set txt = ($txt $BSL)
+                else if ($tmode == C && "$c1" =~ 3[0-9]) then
+                    set txt = ($txt $c1)
+                else
+                    set txt = ($txt $BSL $c1)
+                endif
+                @ i += 2
+            endif
+        else if ($c == $DOL && "$c1" =~ 3[0-9]) then
+            @ e = $i + 1
+            set num = 0
+            while ("$p[$e]" =~ 3[0-9])
+                @ num = $num * 10 + $p[$e] - 30
+                @ e++
+            end
+            if ($num >= 1 && $num <= $#argv) then
+                printf '%s' $argv[$num]:q | od -An -v -tx1 > $t7
+                foreach v (`cat $t7`)
+                    if ($v == $NL && $tmode != file) then
+                        set txt = ($txt $BSL $NL)
+                    else if ($tmode == C && ($v == $AMP || $v == $SLASH)) then
+                        set txt = ($txt $BSL $v)
+                    else
+                        set txt = ($txt $v)
+                    endif
+                end
+            endif
+            set i = $e
+        else if ($tmode == C && ($c == $AMP || $c == $SLASH)) then
+            set txt = ($txt $BSL $c)
+            @ i++
+        else
+            set txt = ($txt $c)
+            @ i++
+        endif
+        breaksw
+
+    # ------------------------------------------------------------ LABEL
+    case LABEL:
+        if (($c == $SP || $c == $TAB) && $#lbl == 0) then
+            @ i++
+        else if ($c == ZZ || $c == $SEMI || $c == $NL || $c == $SP || $c == $TAB || $c == $RBR) then
+            if ($lmode == colon) then
+                set out = ($out $lbl)
+            else if ($lmode == branch && $#lbl > 0) then
+                set out = ($out $SP $lbl)
+            endif
+            set state = ENDCMD
+        else
+            set lbl = ($lbl $c)
+            @ i++
+        endif
+        breaksw
+
+    case NUMARG:
+        if (($c == $SP || $c == $TAB) && $nd == 0) then
+            @ i++
+        else if ("$c" =~ 3[0-9]) then
+            set out = ($out $c)
+            @ nd++
+            @ i++
+        else
+            set state = ENDCMD
+        endif
+        breaksw
+
+    # ------------------------------------------------------------- WRAP
+    # F (wmode reset) becomes
+    #       ADDR{ ; t L ; :L ; }
+    # A t that jumps to the very next line only clears the flag.
+    #
+    # C and Z (wmode keepflag) run the substitution S without touching
+    # the t flag:
+    #       ADDR{
+    #       t LT                flag was set: go to LT (this clears it)
+    #       S
+    #       t LF                flag was clear: clear whatever S did
+    #       :LF
+    #       b LE
+    #       :LT
+    #       S
+    #       s/^//               and set it again
+    #       :LE
+    #       }
+    case WRAP:
+        @ lab++
+        set num = $lab
+        set dg = ()
+        while ($num > 0)
+            @ d = $num % 10
+            set dg = (3$d $dg)
+            @ num = $num / 10
+        end
+        set LT = ($LABPFX $dg 54)
+        set LF = ($LABPFX $dg 46)
+        set LE = ($LABPFX $dg 45)
+        set out = ($addr $LBR $NL)
+        if ($wmode == reset) then
+            set out = ($out 74 $SP $LF $NL $COLON $LF $NL)
+        else
+            set out = ($out 74 $SP $LT $NL $S $NL)
+            set out = ($out 74 $SP $LF $NL $COLON $LF $NL)
+            set out = ($out 62 $SP $LE $NL $COLON $LT $NL)
+            set out = ($out $S $NL $S_SETF $NL $COLON $LE $NL)
+        endif
+        set out = ($out $RBR)
+        set state = ENDCMD
+        breaksw
+
+    # ----------------------------------------------------------- ENDCMD
+    case ENDCMD:
+        if ($c == $SP || $c == $TAB) then
+            @ i++
+        else if ($c == $SEMI || $c == $NL || $c == $RBR || $c == $HASH || $c == ZZ) then
+            if ($#out > 0) then
+                set out = ($out $NL)
+                echo $out >> $t8
+            endif
+            set state = START
+        else
+            set err = "extra characters after command"
+            set state = ERR
+        endif
+        breaksw
+
+    default:
+        set err = "internal error: state $state"
+        set state = ERR
+        breaksw
+    endsw
+end
+
+if ($state == ERR) then
+    echo "msed: char ${i}: $err" >> /dev/stderr
+    set st = 1
+    goto cleanup
+endif
+
+# ----------------------------------------------------------------- run
+# t8 holds hex words; turn them into \xHH escapes and let printf write
+# the bytes.  xargs passes the whole file as one argument, so csh never
+# sees the decoded script.
+sed 's/[0-9a-f][0-9a-f]/\\x&/g' $t8 | tr -d ' \n' > $t7
+xargs -0 -r printf < $t7 > $t9
+sed -f $t9 $t4
+set st = $status
+
+cleanup:
+rm -f $t4 $t5 $t6 $t7 $t8 $t9
+exit $st

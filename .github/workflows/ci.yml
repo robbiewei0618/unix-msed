@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install csh, tcsh and GNU awk
+        run: sudo apt-get update && sudo apt-get install -y csh tcsh gawk
+      - name: Hand-written cases
+        run: make golden
+      - name: Random differential tests against GNU sed
+        run: make fuzz CASES=500 SEED=${{ github.run_number }}
